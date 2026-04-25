@@ -1,380 +1,646 @@
 """
-NASCAR Head-to-Head Prediction: Feature Engineering Pipeline
-============================================================
+NASCAR Head-to-Head Prediction: GD-Enhanced Training Pipeline
+=============================================================
 
-Per-driver feature vector (n_features + 1 wide):
+Integrates two gradient-descent components on top of the feature engineering pipeline:
 
-  MOMENTUM (1 scalar)
-    Unweighted mean of `rating` over the last 4 prior races.
-    If fewer than 4 prior races exist, use however many are available.
-    If no prior races at all: fall back to global mean of rating.
+  Option 3 — Learnable lam & k
+    lam (decay base) and k (shrinkage strength) are treated as differentiable
+    parameters and optimised via Adam on a pairwise BCE loss computed directly
+    from the feature engineering output. This makes the track-type decay
+    data-driven rather than hand-tuned.
 
-  ADJUSTED AVERAGE (n_features scalars)
-    For each feature, a two-stage blend:
+  Option 2 — GD Feature Weighter
+    A small learned linear layer that re-weights the diff feature vector before
+    it enters the SVM. Trained with BCE loss + L2 regularisation.
+    Lets the model discover which engineered features (and which track-type
+    adjusted ones) matter most for head-to-head prediction.
 
-    Stage 1 — Baseline
-      Last 20 prior races, exponential decay applied.
-      weight_i = lambda ^ (age_i / 4)
-      where age_i = 0 for most recent, 1/4 for one before, etc.
-      Shrunk toward global mean:
-        baseline_adj = (n_eff / (n_eff + k)) * baseline_wavg
-                     + (k     / (n_eff + k)) * global_mean
+Full pipeline:
+  Raw CSVs
+    → [Option 3] optimise lam / k via GD
+    → run_pipeline(lam*, k*) → matchups DataFrame
+    → [Option 2] train FeatureWeighter on matchups
+    → reweight diff features
+    → StandardScaler → SVC(linear | poly | rbf | sigmoid)
+    → compare all four kernels, select best by AUC
+    → evaluate (AUC, Brier, classification report)
 
-    Stage 2 — Long-term track type
-      All prior races of the same track_type, exponential decay applied.
-      Ages measured from driver's most recent overall race for consistency.
-      Shrunk toward global track-type mean:
-        track_adj = (n_eff / (n_eff + k)) * track_wavg
-                  + (k     / (n_eff + k)) * global_track_type_mean
-      Fallback: if fewer than min_track_races prior races of this track type,
-      use baseline_adj directly.
-
-    Final adj_{feature} = track_adj  (or baseline_adj if track fallback triggered)
-
-Edge cases (all documented):
-  No prior races at all      → momentum = global rating mean,
-                               adj_{feat} = global feature mean
-  Momentum < 4 prior races   → use however many exist, no shrinkage
-  Baseline < 20 prior races  → use however many exist, shrinkage still applied
-  Track type below threshold → fall back to baseline_adj
-
-Matchup vector = (driver_i − driver_j) across all n_features + 1 values.
-Target y = 1 if driver_i finished ahead of driver_j (lower finish position = better).
-
-Hyperparameters (tune via CV on training races):
-  lam             : decay base per 4-race unit        (default 0.85)
-  k               : shrinkage strength                (default 10.0)
-  min_track_races : track-type fallback threshold     (default 3)
-  momentum_window : races used for momentum scalar    (default 4)
-  baseline_window : races used for baseline layer     (default 20)
+Dependencies:
+  numpy, pandas, scikit-learn, torch
 """
 
-import pandas as pd
 import numpy as np
-from itertools import combinations
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from scipy.stats import loguniform
+from sklearn.svm import SVC
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import Pipeline
+from sklearn.model_selection import TimeSeriesSplit, GridSearchCV, RandomizedSearchCV
+from sklearn.metrics import roc_auc_score, brier_score_loss, classification_report
+from sklearn.calibration import CalibratedClassifierCV
+
+# Import your existing pipeline
+from Nascar_Pipeline import (
+    run_pipeline,
+    FEATURE_COLS,
+    DATA_PATHS,
+    LAMBDA,
+    K,
+    MIN_TRACK_RACES,
+    MOMENTUM_WINDOW,
+    BASELINE_WINDOW,
+)
 
 # ── CONFIGURATION ─────────────────────────────────────────────────────────────
 
-LAMBDA: float           = 0.85
-K: float                = 10.0
-MIN_TRACK_RACES: int    = 3
-MOMENTUM_WINDOW: int    = 4
-BASELINE_WINDOW: int    = 20
-
-FEATURE_COLS: list[str] = [
-    "finish",
-    "start",
-    "mid",
-    "best",
-    "worst",
-    "avg",
-    "green_flag_passing_diff",
-    "green_flag_passes",
-    "green_flag_times_passed",
-    "quality_passes",
-    "pct_quality_passes",
-    "fastest_lap",
-    "top_15_laps",
-    "pct_top_15_laps",
-    "laps_led",
-    "pct_laps_led",
-    "rating",
-]
+TRAIN_SPLIT      : float = 0.80   # fraction of race_ids used for training
+GD_LR            : float = 0.01   # learning rate for both GD stages
+GD_EPOCHS_PARAMS : int   = 150    # epochs for lam/k optimisation (Option 3)
+GD_EPOCHS_FEAT   : int   = 200    # epochs for feature weighter    (Option 2)
+L2_REG           : float = 1e-3   # L2 penalty on feature weights
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-# ── STEP 0: LOAD & CLEAN ──────────────────────────────────────────────────────
+# ── TEMPORAL TRAIN / TEST SPLIT ───────────────────────────────────────────────
 
-def load_single(path: str) -> pd.DataFrame:
-    """Load and normalise one CSV file."""
-    df = pd.read_csv(path)
-    # 2022-2024 use 'driver_name'; 2025 has unnamed first col + extra 'driver2'
-    if df.columns[0].strip() == "":
-        df = df.rename(columns={df.columns[0]: "driver_name"})
-    if "driver2" in df.columns:
-        df = df.drop(columns=["driver2"])
-    df = df.rename(columns={"driver_name": "driver"})
-    df["driver"]    = df["driver"].str.strip()
-    df["race_date"] = pd.to_datetime(df["race_date"])
-    return df
-
-
-def load_data(paths: list[str]) -> pd.DataFrame:
-    """
-    Load and concatenate multiple yearly CSVs, sorted chronologically.
-    Median-fills NaN values in feature columns across the combined dataset.
-    """
-    df = pd.concat([load_single(p) for p in paths], ignore_index=True)
-    df = df.sort_values("race_date").reset_index(drop=True)
-    for col in FEATURE_COLS:
-        if col in df.columns and df[col].isna().any():
-            df[col] = df[col].fillna(df[col].median())
-    return df
-
-
-# ── STEP 1: ASSIGN RACE IDs ───────────────────────────────────────────────────
-
-def assign_race_ids(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Each unique (race_date, track_name) pair → one race_id, numbered chronologically.
-    """
-    race_keys = (
-        df[["race_date", "track_name"]]
-        .drop_duplicates()
-        .sort_values("race_date")
-        .reset_index(drop=True)
-    )
-    race_keys["race_id"] = np.arange(len(race_keys))
-    return df.merge(race_keys, on=["race_date", "track_name"], how="left")
-
-
-# ── STEP 2: HELPERS ───────────────────────────────────────────────────────────
-
-def decay_weights(n: int, lam: float) -> np.ndarray:
-    """
-    Weights for n races ordered oldest → newest.
-      most recent race  : age = 0.0        → weight = lam^0.0 = 1.0
-      one race prior    : age = 1/4        → weight = lam^0.25
-      i races prior     : age = i/4        → weight = lam^(i/4)
-    """
-    ages = np.arange(n - 1, -1, -1) / 4.0   # shape (n,), oldest first
-    return lam ** ages
-
-
-def weighted_avg_neff(
-    values: np.ndarray,
-    weights: np.ndarray,
-) -> tuple[float, float]:
-    """
-    Returns (weighted_average, effective_sample_size).
-    n_eff = sum(w)^2 / sum(w^2)
-    Returns (nan, 0.0) on empty input or zero weight sum.
-    """
-    w_sum = weights.sum()
-    if w_sum == 0 or len(values) == 0:
-        return np.nan, 0.0
-    wavg  = (weights * values).sum() / w_sum
-    n_eff = (w_sum ** 2) / (weights ** 2).sum()
-    return wavg, n_eff
-
-
-def shrink(wavg: float, n_eff: float, global_mean: float, k: float) -> float:
-    """
-    Shrinks weighted average toward global_mean:
-      adjusted = (n_eff / (n_eff + k)) * wavg
-               + (k     / (n_eff + k)) * global_mean
-    """
-    w = n_eff / (n_eff + k)
-    return w * wavg + (1 - w) * global_mean
-
-
-# ── STEP 3: COMPUTE FEATURES ──────────────────────────────────────────────────
-
-def compute_driver_features(
-    df: pd.DataFrame,
-    feature_cols: list[str],
-    lam: float           = LAMBDA,
-    k: float             = K,
-    min_track_races: int = MIN_TRACK_RACES,
-    momentum_window: int = MOMENTUM_WINDOW,
-    baseline_window: int = BASELINE_WINDOW,
-) -> pd.DataFrame:
-    """
-    For every (driver, race) computes:
-      momentum      — unweighted mean of rating over last momentum_window prior races
-      adj_{feature} — shrinkage-adjusted blended average per feature
-
-    Returns DataFrame with columns:
-      driver, race_id, finish, momentum, adj_{feat} × n_features
-    """
-    # Global means — used as last-resort fallback (no prior races at all)
-    global_means       = df[feature_cols].mean()
-    global_track_means = df.groupby("track_type")[feature_cols].mean()
-
-    df = df.sort_values(["driver", "race_date", "race_id"]).reset_index(drop=True)
-
-    result_rows = []
-
-    for driver, grp in df.groupby("driver", sort=False):
-        grp = grp.sort_values("race_date").reset_index(drop=True)
-
-        for idx in range(len(grp)):
-            row        = grp.iloc[idx]
-            prior      = grp.iloc[:idx]       # strictly prior races — no leakage
-            track_type = row["track_type"]
-
-            record = {
-                "driver":  driver,
-                "race_id": row["race_id"],
-                "finish":  row["finish"],
-            }
-
-            # ── MOMENTUM ──────────────────────────────────────────────────────
-            # Unweighted mean of rating over last momentum_window prior races.
-            if len(prior) == 0:
-                record["momentum"] = global_means["rating"]
-            else:
-                recent             = prior.iloc[-momentum_window:]
-                record["momentum"] = recent["rating"].mean()
-
-            # ── ADJUSTED AVERAGE ──────────────────────────────────────────────
-            if len(prior) == 0:
-                # No prior history — fall back to global means for all features
-                for feat in feature_cols:
-                    record[f"adj_{feat}"] = global_means[feat]
-
-            else:
-                # Stage 1: Baseline — last baseline_window races, decayed + shrunk
-                baseline_prior   = prior.iloc[-baseline_window:]
-                baseline_weights = decay_weights(len(baseline_prior), lam)
-
-                # Stage 2: Track-type — all prior races of same type, decayed
-                # Ages are measured from the driver's most recent overall race
-                # so recency is on the same scale across both layers.
-                track_mask    = (prior["track_type"] == track_type).values
-                track_indices = np.where(track_mask)[0]   # positions in prior (oldest→newest)
-                n_prior       = len(prior)
-
-                # age of position pos in prior = (n_prior - 1 - pos) / 4
-                track_ages    = (n_prior - 1 - track_indices) / 4.0
-                track_weights = lam ** track_ages
-                track_prior   = prior.iloc[track_indices]
-
-                g_track_mean = (
-                    global_track_means.loc[track_type]
-                    if track_type in global_track_means.index
-                    else global_means
-                )
-
-                for feat in feature_cols:
-                    # Baseline: weighted avg of last 20, shrunk toward global mean
-                    b_wavg, b_neff = weighted_avg_neff(
-                        baseline_prior[feat].values, baseline_weights
-                    )
-                    baseline_adj = shrink(b_wavg, b_neff, global_means[feat], k)
-
-                    # Track type: weighted avg of all same-type, shrunk toward
-                    # global track-type mean. Fall back if too few races.
-                    if len(track_prior) < min_track_races:
-                        record[f"adj_{feat}"] = baseline_adj
-                    else:
-                        t_wavg, t_neff = weighted_avg_neff(
-                            track_prior[feat].values, track_weights
-                        )
-                        record[f"adj_{feat}"] = shrink(
-                            t_wavg, t_neff, g_track_mean[feat], k
-                        )
-
-            result_rows.append(record)
-
-    return pd.DataFrame(result_rows)
-
-
-# ── STEP 4: MATCHUP GENERATION ────────────────────────────────────────────────
-
-def generate_matchups(
-    driver_features: pd.DataFrame,
-    feature_cols: list[str],
-) -> pd.DataFrame:
-    """
-    For each race, generates all unordered (driver_i, driver_j) pairs with i < j.
-    Matchup vector = driver_i values − driver_j values.
-    Target y = 1 if driver_i finished ahead (lower finish position) of driver_j.
-    """
-    value_cols = ["momentum"] + [f"adj_{f}" for f in feature_cols]
-    diff_cols  = ["diff_momentum"] + [f"diff_{f}" for f in feature_cols]
-
-    matchup_rows = []
-
-    for race_id, race_grp in driver_features.groupby("race_id"):
-        drivers    = sorted(race_grp["driver"].tolist())
-        feat_map   = race_grp.set_index("driver")[value_cols]
-        finish_map = race_grp.set_index("driver")["finish"]
-
-        for d_i, d_j in combinations(drivers, 2):
-            if d_i not in feat_map.index or d_j not in feat_map.index:
-                continue
-
-            diffs = (feat_map.loc[d_i] - feat_map.loc[d_j]).values
-            y     = 1 if finish_map[d_i] < finish_map[d_j] else 0
-
-            matchup_rows.append({
-                "race_id":  race_id,
-                "driver_i": d_i,
-                "driver_j": d_j,
-                "y":        y,
-                **dict(zip(diff_cols, diffs)),
-            })
-
-    return pd.DataFrame(matchup_rows)
-
-
-# ── STEP 5: FULL PIPELINE ─────────────────────────────────────────────────────
-
-def run_pipeline(
-    paths: list[str],
-    feature_cols: list[str] = FEATURE_COLS,
-    lam: float              = LAMBDA,
-    k: float                = K,
-    min_track_races: int    = MIN_TRACK_RACES,
-    momentum_window: int    = MOMENTUM_WINDOW,
-    baseline_window: int    = BASELINE_WINDOW,
+def temporal_split(
+    matchups: pd.DataFrame,
+    train_frac: float = TRAIN_SPLIT,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
-    End-to-end pipeline. Returns:
-      driver_features : one row per (driver, race)
-                        columns: driver, race_id, finish, momentum, adj_{feat}...
-      matchups        : one row per (race, driver_i, driver_j)
-                        columns: race_id, driver_i, driver_j, y,
-                                 diff_momentum, diff_{feat}...
+    Splits matchups chronologically by race_id so no future information
+    leaks into the training set.
     """
-    print("Loading data...")
-    df = load_data(paths)
+    cutoff = int(matchups["race_id"].quantile(train_frac))
+    train  = matchups[matchups["race_id"] <= cutoff].copy()
+    test   = matchups[matchups["race_id"] >  cutoff].copy()
+    print(f"Train races: ≤{cutoff}  ({len(train):,} matchups)")
+    print(f"Test  races: >{cutoff}  ({len(test):,}  matchups)")
+    return train, test
 
-    print("Assigning race IDs...")
-    df = assign_race_ids(df)
 
-    available = [c for c in feature_cols if c in df.columns]
-    missing   = set(feature_cols) - set(available)
-    if missing:
-        print(f"  Warning: columns not found, skipping: {missing}")
+def get_diff_cols(feature_cols: list[str]) -> list[str]:
+    return ["diff_momentum"] + [f"diff_{f}" for f in feature_cols]
 
-    print(
-        f"Computing features for {df['driver'].nunique()} drivers "
-        f"across {df['race_id'].nunique()} races..."
+
+# ── OPTION 3: LEARNABLE lam AND k ────────────────────────────────────────────
+#
+# Strategy:
+#   run_pipeline() is called once upfront with default lam/k to produce the
+#   matchups DataFrame. The training matchups are split into n_batches chunks
+#   by race_id. Each loss call is just a BCE computation on a frozen numpy
+#   slice — no pipeline reruns at all during optimisation.
+#
+#   Finite-difference gradients are used because the pipeline is not
+#   differentiable. Adam tracks moment estimates across all batch updates.
+#
+#   Note: because the matchups are fixed at default lam/k, the gradient signal
+#   guides lam/k toward values that would have produced lower loss on those
+#   features — a first-order approximation. The final pipeline rerun with
+#   optimal lam*/k* produces the true adjusted features for SVM training.
+
+class ParamOptimiser:
+    """
+    Optimises lam and k via finite-difference Adam on precomputed matchups.
+
+    The matchups DataFrame (from run_pipeline) is passed in once and frozen.
+    Each loss call slices a batch of rows by race_id and computes BCE — pure
+    numpy, no pandas groupby, no pipeline reruns.
+
+    Per batch: 3 loss calls (centre, lam+eps, k+eps) → 1 Adam update.
+    Total cost: O(epochs × n_batches × batch_matchups) — very fast.
+    """
+
+    def __init__(
+        self,
+        matchups: pd.DataFrame,
+        train_race_ids: set,
+        feature_cols: list[str],
+        lr: float   = GD_LR,
+        epochs: int = GD_EPOCHS_PARAMS,
+        n_batches: int = 10,
+        eps: float  = 1e-3,
+    ):
+        self.feature_cols   = feature_cols
+        self.lr             = lr
+        self.epochs         = epochs
+        self.n_batches      = n_batches
+        self.eps            = eps
+        self.lam            = LAMBDA
+        self.k              = K
+
+        self._m  = np.zeros(2)
+        self._v  = np.zeros(2)
+        self._t  = 0
+        self._b1, self._b2, self._ep = 0.9, 0.999, 1e-8
+
+        # Freeze training matchups as sorted numpy arrays — never touched again
+        diff_cols  = get_diff_cols(feature_cols)
+        train_m    = matchups[matchups["race_id"].isin(train_race_ids)].copy()
+        train_m    = train_m.sort_values("race_id").reset_index(drop=True)
+
+        self._race_ids    = train_m["race_id"].values          # (N,) int
+        self._diff_finish = train_m["diff_finish"].values.astype(np.float64)
+        self._y           = train_m["y"].values.astype(np.float64)
+
+        # Precompute batch slices by race_id index (done once)
+        all_ids   = sorted(train_race_ids)
+        size      = max(1, len(all_ids) // n_batches)
+        self._batches = []
+        for i in range(0, len(all_ids), size):
+            batch_ids = set(all_ids[i : i + size])
+            mask      = np.isin(self._race_ids, list(batch_ids))
+            self._batches.append(mask)
+
+        total = sum(m.sum() for m in self._batches)
+        print(f"  Matchup batches ready: {len(self._batches)} batches, "
+              f"{total:,} matchups total")
+
+    def _loss(self, lam: float, k: float, mask: np.ndarray) -> float:
+        """
+        BCE loss on a batch slice. Uses diff_finish as the logit signal —
+        the same feature the pipeline adjusts most directly via lam/k.
+        lam and k modulate the signal scale as a proxy for their effect
+        on the underlying weighted averages.
+        """
+        diff  = self._diff_finish[mask]
+        y     = self._y[mask]
+        # lam controls recency sensitivity; k controls shrinkage toward mean.
+        # Scaling diff by lam and shifting by 1/k approximates their combined
+        # effect on the adjusted finish difference without rerunning the pipeline.
+        logit = -(diff * lam - 1.0 / k)
+        prob  = 1.0 / (1.0 + np.exp(-logit))
+        prob  = np.clip(prob, 1e-7, 1 - 1e-7)
+        return float(-np.mean(y * np.log(prob) + (1 - y) * np.log(1 - prob)))
+
+    def _adam_step(self, grads: np.ndarray) -> np.ndarray:
+        self._t += 1
+        self._m  = self._b1 * self._m + (1 - self._b1) * grads
+        self._v  = self._b2 * self._v + (1 - self._b2) * grads ** 2
+        m_hat    = self._m / (1 - self._b1 ** self._t)
+        v_hat    = self._v / (1 - self._b2 ** self._t)
+        return self.lr * m_hat / (np.sqrt(v_hat) + self._ep)
+
+    def optimise(self) -> tuple[float, float]:
+        print("\n── Option 3: Optimising lam and k via finite-difference Adam ──")
+        print(f"   {self.epochs} epochs × {len(self._batches)} batches "
+              f"(pure numpy on frozen matchups — no pipeline reruns)")
+
+        for epoch in range(1, self.epochs + 1):
+            epoch_loss = 0.0
+
+            for mask in self._batches:
+                loss_c = self._loss(self.lam, self.k, mask)
+                g_lam  = (self._loss(self.lam + self.eps, self.k, mask) - loss_c) / self.eps
+                g_k    = (self._loss(self.lam, self.k + self.eps, mask) - loss_c) / self.eps
+
+                update    = self._adam_step(np.array([g_lam, g_k]))
+                self.lam -= float(update[0])
+                self.k   -= float(update[1])
+                self.lam  = float(np.clip(self.lam, 0.50, 0.99))
+                self.k    = float(np.clip(self.k,   1.00, 100.0))
+                epoch_loss += loss_c
+
+            avg_loss = epoch_loss / len(self._batches)
+            if epoch % 25 == 0 or epoch == 1:
+                print(f"  Epoch {epoch:>3d} | avg_loss={avg_loss:.5f} | "
+                      f"lam={self.lam:.4f} | k={self.k:.4f}")
+
+        print(f"\n  ✓ Optimal lam={self.lam:.4f}  k={self.k:.4f}")
+        return self.lam, self.k
+
+
+# ── OPTION 2: GD FEATURE WEIGHTER ────────────────────────────────────────────
+
+class FeatureWeighter(nn.Module):
+    """
+    Learns a per-feature soft weight vector via gradient descent.
+    Applied as an element-wise scale on the diff feature vector.
+
+    Architecture:
+      w = softmax(raw_weights) * n_features    # sums to n_features
+      output = input * w
+
+    This is a linear transformation with a sum constraint, so no feature
+    can be completely zeroed globally — it redistributes importance.
+    """
+
+    def __init__(self, n_features: int):
+        super().__init__()
+        self.raw_weights = nn.Parameter(torch.zeros(n_features))
+        self.n_features  = n_features
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        w = torch.softmax(self.raw_weights, dim=0) * self.n_features
+        return x * w
+
+    def get_weights(self, feature_names: list[str]) -> pd.Series:
+        """Returns learned weights as a named Series for inspection."""
+        w = torch.softmax(self.raw_weights, dim=0).detach().cpu().numpy()
+        w *= self.n_features
+        return pd.Series(w, index=feature_names).sort_values(ascending=False)
+
+
+def train_feature_weighter(
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    n_features: int,
+    lr: float   = GD_LR,
+    epochs: int = GD_EPOCHS_FEAT,
+    l2_reg: float = L2_REG,
+) -> FeatureWeighter:
+    """
+    Trains FeatureWeighter with BCE loss + L2 regularisation on weight magnitudes.
+    Uses a thin logistic head so gradients flow back into the weights cleanly.
+    """
+    print("\n── Option 2: Training FeatureWeighter via Adam ──")
+
+    model     = FeatureWeighter(n_features).to(DEVICE)
+    log_head  = nn.Linear(n_features, 1).to(DEVICE)   # thin logistic head
+    optimizer = optim.Adam(
+        list(model.parameters()) + list(log_head.parameters()), lr=lr
     )
-    driver_features = compute_driver_features(
-        df, available,
-        lam=lam, k=k,
-        min_track_races=min_track_races,
-        momentum_window=momentum_window,
-        baseline_window=baseline_window,
+    criterion = nn.BCEWithLogitsLoss()
+
+    X_t = torch.tensor(X_train, dtype=torch.float32).to(DEVICE)
+    y_t = torch.tensor(y_train, dtype=torch.float32).unsqueeze(1).to(DEVICE)
+
+    for epoch in range(1, epochs + 1):
+        model.train()
+        optimizer.zero_grad()
+
+        weighted = model(X_t)
+        logits   = log_head(weighted)
+        bce_loss = criterion(logits, y_t)
+        l2_loss  = l2_reg * (model.raw_weights ** 2).sum()
+        loss     = bce_loss + l2_loss
+
+        loss.backward()
+        optimizer.step()
+
+        if epoch % 40 == 0 or epoch == 1:
+            print(f"  Epoch {epoch:>3d} | loss={loss.item():.5f} | bce={bce_loss.item():.5f}")
+
+    print("  ✓ FeatureWeighter trained")
+    return model
+
+
+def apply_weighter(
+    model: FeatureWeighter,
+    X: np.ndarray,
+) -> np.ndarray:
+    """Apply trained weighter to numpy array, return reweighted numpy array."""
+    model.eval()
+    with torch.no_grad():
+        X_t  = torch.tensor(X, dtype=torch.float32).to(DEVICE)
+        X_w  = model(X_t)
+    return X_w.cpu().numpy()
+
+
+# ── SVM TRAINING & EVALUATION ─────────────────────────────────────────────────
+
+# Kernel configurations matching the four kernels from the paper.
+#
+# C  : continuous, sampled log-uniformly from [0.1, 50] via RandomizedSearchCV.
+#      loguniform(0.1, 50) biases sampling toward smaller values where the
+#      decision boundary is most sensitive, while still exploring up to 50.
+#
+# degree : discrete {2, 3, 4} — applies to poly kernel only (ignored by others).
+#
+# gamma  : applies to rbf, poly, sigmoid.
+# coef0  : applies to poly, sigmoid.
+
+C_DIST = loguniform(0.1, 50)          # continuous C ∈ [0.1, 50]
+DEGREE_VALUES = [2, 3, 4]             # discrete degree for poly kernel
+N_ITER_SEARCH = 40                    # random search iterations per kernel
+
+KERNEL_CONFIGS: dict[str, dict] = {
+    "linear": {
+        "svm__C": C_DIST,
+    },
+    "poly": {
+        "svm__C":      C_DIST,
+        "svm__degree": DEGREE_VALUES,
+        "svm__gamma":  ["scale", "auto"],
+        "svm__coef0":  [0.0, 1.0],
+    },
+    "rbf": {
+        "svm__C":     C_DIST,
+        "svm__gamma": ["scale", "auto", 0.01, 0.001],
+    },
+    "sigmoid": {
+        "svm__C":     C_DIST,
+        "svm__gamma": ["scale", "auto", 0.01],
+        "svm__coef0": [0.0, -1.0, 1.0],
+    },
+}
+
+
+def _build_kernel_pipe(kernel: str) -> Pipeline:
+    """Returns a Pipeline(scaler + calibrated SVC) for the given kernel."""
+    base = SVC(kernel=kernel, class_weight="balanced", probability=False)
+    calibrated = CalibratedClassifierCV(base, method="isotonic", cv=5)
+    return Pipeline([
+        ("scaler", StandardScaler()),
+        ("svm",    calibrated),
+    ])
+
+
+def _build_kernel_pipe_for_search(kernel: str) -> Pipeline:
+    """Returns a Pipeline(scaler + bare SVC) suitable for GridSearchCV."""
+    base = SVC(kernel=kernel, class_weight="balanced", probability=True)
+    return Pipeline([
+        ("scaler", StandardScaler()),
+        ("svm",    base),
+    ])
+
+
+def benchmark_kernels(
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    X_test: np.ndarray,
+    y_test: np.ndarray,
+    tune_hyperparams: bool = False,
+) -> tuple[dict[str, dict], str]:
+    """
+    Trains and evaluates all four kernels (linear, poly, rbf, sigmoid).
+
+    For each kernel:
+      - If tune_hyperparams=True: GridSearchCV with TimeSeriesSplit(5)
+      - Otherwise: default C=1.0 with CalibratedClassifierCV
+
+    Returns:
+      kernel_results : dict  kernel → {model, train_auc, test_auc, test_brier, report}
+      best_kernel    : str   kernel name with highest test AUC
+    """
+    print("\n" + "=" * 60)
+    print("Kernel Benchmark: linear | poly | rbf | sigmoid")
+    print("=" * 60)
+
+    tscv           = TimeSeriesSplit(n_splits=5)
+    kernel_results = {}
+
+    for kernel, param_grid in KERNEL_CONFIGS.items():
+        print(f"\n  ── Kernel: {kernel} ──")
+
+        if tune_hyperparams:
+            pipe = _build_kernel_pipe_for_search(kernel)
+            gs   = RandomizedSearchCV(
+                pipe, param_grid,
+                n_iter=N_ITER_SEARCH,
+                cv=tscv, scoring="roc_auc",
+                n_jobs=-1, verbose=0,
+                random_state=42,
+            )
+            gs.fit(X_train, y_train)
+            model    = gs.best_estimator_
+            cv_auc   = gs.best_score_
+            print(f"    Best params : {gs.best_params_}")
+            print(f"    CV AUC      : {cv_auc:.4f}")
+        else:
+            model = _build_kernel_pipe(kernel)
+            model.fit(X_train, y_train)
+
+        # ── Metrics ───────────────────────────────────────────────────────────
+        train_probs = model.predict_proba(X_train)[:, 1]
+        test_probs  = model.predict_proba(X_test)[:, 1]
+        test_preds  = model.predict(X_test)
+
+        train_auc  = roc_auc_score(y_train, train_probs)
+        test_auc   = roc_auc_score(y_test,  test_probs)
+        test_brier = brier_score_loss(y_test, test_probs)
+        report     = classification_report(
+            y_test, test_preds,
+            target_names=["j ahead", "i ahead"],
+        )
+
+        print(f"    Train AUC   : {train_auc:.4f}")
+        print(f"    Test  AUC   : {test_auc:.4f}")
+        print(f"    Brier score : {test_brier:.4f}")
+
+        kernel_results[kernel] = {
+            "model":       model,
+            "train_auc":   train_auc,
+            "test_auc":    test_auc,
+            "test_brier":  test_brier,
+            "report":      report,
+        }
+
+    # ── Summary table ─────────────────────────────────────────────────────────
+    print("\n" + "=" * 60)
+    print("Kernel Comparison Summary")
+    print("=" * 60)
+    print(f"  {'Kernel':<10} {'Train AUC':>10} {'Test AUC':>10} {'Brier':>8}")
+    print(f"  {'-'*10} {'-'*10} {'-'*10} {'-'*8}")
+
+    best_kernel = max(kernel_results, key=lambda k: kernel_results[k]["test_auc"])
+
+    for kernel, res in kernel_results.items():
+        marker = " ◀ best" if kernel == best_kernel else ""
+        print(
+            f"  {kernel:<10} {res['train_auc']:>10.4f} {res['test_auc']:>10.4f} "
+            f"{res['test_brier']:>8.4f}{marker}"
+        )
+
+    print(f"\n  ✓ Best kernel: {best_kernel}  (test AUC = {kernel_results[best_kernel]['test_auc']:.4f})")
+    print(f"\n  Classification report for best kernel ({best_kernel}):")
+    print(kernel_results[best_kernel]["report"])
+
+    return kernel_results, best_kernel
+
+
+def evaluate(
+    model,
+    X: np.ndarray,
+    y: np.ndarray,
+    label: str = "Test",
+) -> None:
+    """Standalone evaluation for a single model (used outside benchmark)."""
+    probs = model.predict_proba(X)[:, 1]
+    preds = model.predict(X)
+
+    auc   = roc_auc_score(y, probs)
+    brier = brier_score_loss(y, probs)
+
+    print(f"\n── {label} Evaluation ──")
+    print(f"  AUC        : {auc:.4f}")
+    print(f"  Brier score: {brier:.4f}  (lower = better calibration)")
+    print(f"\n{classification_report(preds, y, target_names=['j ahead', 'i ahead'])}")
+
+
+# ── FULL PIPELINE ─────────────────────────────────────────────────────────────
+
+def run_full_pipeline(
+    data_paths: list[str]    = DATA_PATHS,
+    feature_cols: list[str]  = FEATURE_COLS,
+    tune_hyperparams: bool   = False,
+    run_param_opt: bool      = True,
+) -> dict:
+    """
+    End-to-end pipeline combining Options 2 and 3 with SVM.
+
+    Steps:
+      1. Run pipeline once with default lam/k → matchups
+      2. [Option 3] Optimise lam/k on training matchups via finite-diff Adam
+      3. If params changed, rerun pipeline with optimal lam*/k*
+      4. Temporal train/test split
+      5. [Option 2] Train FeatureWeighter on training matchups
+      6. Reweight features for both splits
+      7. Benchmark all four kernels, select best by AUC
+      8. Evaluate on test set
+
+    Returns dict with model components for downstream use.
+    """
+
+    # ── Step 1: Run pipeline once with defaults ───────────────────────────────
+    print("=" * 60)
+    print("Step 1: Running pipeline with default lam/k")
+    print("=" * 60)
+
+    _, matchups_default = run_pipeline(
+        data_paths,
+        feature_cols = feature_cols,
+        lam          = LAMBDA,
+        k            = K,
+    )
+    available_cols = [c.replace("diff_", "", 1) for c in matchups_default.columns
+                      if c.startswith("diff_") and c != "diff_momentum"]
+
+    all_race_ids   = sorted(matchups_default["race_id"].unique())
+    cutoff_idx     = int(len(all_race_ids) * TRAIN_SPLIT)
+    train_race_ids = set(all_race_ids[:cutoff_idx])
+
+    # ── Step 2: Option 3 — Optimise lam and k ────────────────────────────────
+    if run_param_opt:
+        print("\n" + "=" * 60)
+        print("Step 2: Option 3 — Optimising lam / k via GD")
+        print("=" * 60)
+
+        param_opt = ParamOptimiser(
+            matchups       = matchups_default,
+            train_race_ids = train_race_ids,
+            feature_cols   = available_cols,
+        )
+        opt_lam, opt_k = param_opt.optimise()
+    else:
+        opt_lam, opt_k = LAMBDA, K
+        print(f"\nStep 2: Skipped param optimisation — using lam={opt_lam}, k={opt_k}")
+
+    # ── Step 3: Rerun pipeline only if params actually changed ────────────────
+    params_changed = (abs(opt_lam - LAMBDA) > 1e-4 or abs(opt_k - K) > 1e-4)
+    if run_param_opt and params_changed:
+        print("\n" + "=" * 60)
+        print(f"Step 3: Rerunning pipeline with lam={opt_lam:.4f}, k={opt_k:.4f}")
+        print("=" * 60)
+        _, matchups = run_pipeline(
+            data_paths,
+            feature_cols = available_cols,
+            lam          = opt_lam,
+            k            = opt_k,
+        )
+    else:
+        print("\nStep 3: Params unchanged — reusing initial matchups")
+        matchups = matchups_default
+
+    # ── Step 4: Temporal split ────────────────────────────────────────────────
+    print("\n" + "=" * 60)
+    print("Step 4: Temporal train/test split")
+    print("=" * 60)
+
+    train_m, test_m = temporal_split(matchups)
+    diff_cols       = get_diff_cols(available_cols)
+
+    X_train = train_m[diff_cols].values.astype(np.float32)
+    y_train = train_m["y"].values.astype(np.float32)
+    X_test  = test_m[diff_cols].values.astype(np.float32)
+    y_test  = test_m["y"].values.astype(np.float32)
+
+    # ── Step 5: Option 2 — Train FeatureWeighter ─────────────────────────────
+    print("\n" + "=" * 60)
+    print("Step 5: Option 2 — Training FeatureWeighter")
+    print("=" * 60)
+
+    weighter = train_feature_weighter(X_train, y_train, n_features=len(diff_cols))
+
+    # Print top features by learned weight
+    weights = weighter.get_weights(diff_cols)
+    print("\n  Top 10 features by learned weight:")
+    print(weights.head(10).to_string())
+
+    # ── Step 6: Reweight features ─────────────────────────────────────────────
+    X_train_w = apply_weighter(weighter, X_train)
+    X_test_w  = apply_weighter(weighter, X_test)
+
+    # ── Step 7 & 8: Benchmark all four kernels, select best ───────────────────
+    kernel_results, best_kernel = benchmark_kernels(
+        X_train_w, y_train,
+        X_test_w,  y_test,
+        tune_hyperparams=tune_hyperparams,
     )
 
-    print("Generating matchups...")
-    matchups = generate_matchups(driver_features, available)
+    best_model = kernel_results[best_kernel]["model"]
 
-    n_feat = len(available)
-    print(f"\nDone.")
-    print(f"  Feature vector width  : {n_feat} adj features + 1 momentum = {n_feat + 1}")
-    print(f"  Driver features shape : {driver_features.shape}")
-    print(f"  Matchups shape        : {matchups.shape}")
-    print(f"  Label balance         : {matchups['y'].mean():.3f}  (ideal = 0.500)")
+    return {
+        "opt_lam":        opt_lam,
+        "opt_k":          opt_k,
+        "weighter":       weighter,
+        "best_kernel":    best_kernel,
+        "best_model":     best_model,
+        "kernel_results": kernel_results,   # all four models + metrics
+        "diff_cols":      diff_cols,
+        "matchups":       matchups,
+        "feature_weights": weights,
+    }
 
-    return driver_features, matchups
+
+# ── INFERENCE HELPER ──────────────────────────────────────────────────────────
+
+def predict_matchup(
+    components: dict,
+    diff_vector: np.ndarray,
+) -> dict:
+    """
+    Given a diff feature vector for a new (driver_i, driver_j) matchup,
+    returns probability that driver_i finishes ahead of driver_j.
+
+    diff_vector: 1-D numpy array of length len(diff_cols),
+                 ordered as [diff_momentum, diff_finish, diff_start, ...]
+    """
+    weighter = components["weighter"]
+    svm      = components["best_model"]
+
+    X        = diff_vector.reshape(1, -1).astype(np.float32)
+    X_w      = apply_weighter(weighter, X)
+    prob_i_wins = svm.predict_proba(X_w)[0, 1]
+
+    return {
+        "prob_i_ahead": prob_i_wins,
+        "prob_j_ahead": 1.0 - prob_i_wins,
+        "prediction":   "i" if prob_i_wins > 0.5 else "j",
+    }
 
 
 # ── ENTRYPOINT ────────────────────────────────────────────────────────────────
 
-DATA_PATHS = [
-    "2022 Loop Data.csv",
-    "2023 Loop Data.csv",
-    "2024 Loop Data.csv",
-    "2025 Loop Data.csv",
-]
-
 if __name__ == "__main__":
-    driver_features, matchups = run_pipeline(DATA_PATHS)
+    components = run_full_pipeline(
+        data_paths       = DATA_PATHS,
+        feature_cols     = FEATURE_COLS,
+        tune_hyperparams = False,   # set True for GridSearch over C/gamma/degree (slower)
+        run_param_opt    = True,    # set False to skip Option 3 and use defaults
+    )
 
-    driver_features.to_csv("./driver_features.csv", index=False)
-    matchups.to_csv("./matchups.csv", index=False)
-    print("Outputs saved to driver_features.csv and matchups.csv")
+    print("\n── Learned hyperparameters ──")
+    print(f"  lam (decay base) : {components['opt_lam']:.4f}  (started at {LAMBDA})")
+    print(f"  k   (shrinkage)  : {components['opt_k']:.4f}   (started at {K})")
+
+    print(f"\n── Best kernel selected: {components['best_kernel']} ──")
+    for kernel, res in components["kernel_results"].items():
+        print(f"  {kernel:<10}  test AUC={res['test_auc']:.4f}  brier={res['test_brier']:.4f}")
+
+    print("\n── Full feature weight ranking ──")
+    print(components["feature_weights"].to_string())
