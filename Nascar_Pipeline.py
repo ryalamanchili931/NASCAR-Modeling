@@ -51,6 +51,9 @@ Hyperparameters (tune via CV on training races):
 
 import pandas as pd
 import numpy as np
+from scipy.stats import ks_2samp
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LogisticRegression
 from itertools import combinations
 
 # ── CONFIGURATION ─────────────────────────────────────────────────────────────
@@ -60,6 +63,7 @@ K: float                = 10.0
 MIN_TRACK_RACES: int    = 3
 MOMENTUM_WINDOW: int    = 4
 BASELINE_WINDOW: int    = 20
+MIN_RACE_HISTORY: int   = 10
 
 FEATURE_COLS: list[str] = [
     "finish",
@@ -124,6 +128,7 @@ def assign_race_ids(df: pd.DataFrame) -> pd.DataFrame:
         .reset_index(drop=True)
     )
     race_keys["race_id"] = np.arange(len(race_keys))
+    race_keys["year"] = race_keys["race_date"].dt.year
     return df.merge(race_keys, on=["race_date", "track_name"], how="left")
 
 
@@ -194,17 +199,21 @@ def compute_driver_features(
 
     result_rows = []
 
-    for driver, grp in df.groupby("driver", sort=False):
+    for (driver, team), grp in df.groupby(["driver", "team_name"], sort=False):
         grp = grp.sort_values("race_date").reset_index(drop=True)
 
         for idx in range(len(grp)):
             row        = grp.iloc[idx]
             prior      = grp.iloc[:idx]       # strictly prior races — no leakage
+            if len(prior) < MIN_RACE_HISTORY:
+                continue
             track_type = row["track_type"]
 
             record = {
                 "driver":  driver,
+                "team": team,
                 "race_id": row["race_id"],
+                "year": row["year"],
                 "finish":  row["finish"],
             }
 
@@ -238,6 +247,8 @@ def compute_driver_features(
                 track_ages    = (n_prior - 1 - track_indices) / 4.0
                 track_weights = lam ** track_ages
                 track_prior   = prior.iloc[track_indices]
+                if len(track_prior) < min_track_races:
+                    continue
 
                 g_track_mean = (
                     global_track_means.loc[track_type]
@@ -285,7 +296,7 @@ def generate_matchups(
 
     matchup_rows = []
 
-    for race_id, race_grp in driver_features.groupby("race_id"):
+    for (race_id, year), race_grp in driver_features.groupby(["race_id", "year"]):
         drivers    = sorted(race_grp["driver"].tolist())
         feat_map   = race_grp.set_index("driver")[value_cols]
         finish_map = race_grp.set_index("driver")["finish"]
@@ -305,10 +316,114 @@ def generate_matchups(
                 **dict(zip(diff_cols, diffs)),
             })
 
+            matchup_rows.append({
+                "race_id":  race_id,
+                "year": year,
+                "driver_i": d_j,
+                "driver_j": d_i,
+                "y":        1 - y,
+                **dict(zip(diff_cols, -diffs)),
+            })
+
     return pd.DataFrame(matchup_rows)
 
 
 # ── STEP 5: FULL PIPELINE ─────────────────────────────────────────────────────
+
+def time_based_split(matchups):
+    train = matchups[matchups["year"].isin([2022, 2023])].copy()
+    val   = matchups[matchups["year"] == 2024].copy()
+    test  = matchups[matchups["year"] == 2025].copy()
+
+    return train, val, test
+
+def train_model(X, y):
+    model = LogisticRegression(
+        penalty="l2",
+        solver="lbfgs",
+        max_iter=1000,
+    )
+    model.fit(X, y)
+    return model
+
+# Only works for binary classification with doubled data (y=1 and y=0 rows are exact inverses of each other).
+def classwise_ece(y_true, y_prob, n_bins=20):
+    y_true = np.array(y_true)
+    y_prob = np.array(y_prob)
+    
+    bin_boundaries = np.linspace(0, 1, n_bins + 1)
+    ece = 0.0
+    non_empty_bins = 0
+
+    for i in range(n_bins):
+        lower, upper = bin_boundaries[i], bin_boundaries[i + 1]
+
+        if i == n_bins - 1:
+            in_bin = (y_prob >= lower) & (y_prob <= upper)
+        else:
+            in_bin = (y_prob >= lower) & (y_prob < upper)
+
+        bin_size = np.sum(in_bin)
+
+        print(f'Bin {i + 1}/{n_bins}: [{lower:.2f}, {upper:.2f}) - Size: {bin_size}')
+
+        if bin_size > 0:
+            non_empty_bins += 1
+            accuracy = np.mean(y_true[in_bin])
+            confidence = np.mean(y_prob[in_bin])
+            ece += (bin_size / len(y_prob)) * abs(accuracy - confidence)
+        
+    if non_empty_bins < 0.8 * n_bins:
+        print(f'Fewer than 80% of bins contain predictions.')
+        return 1.0
+
+    print(f'Classwise ECE: {ece:.4f} (calculated over {non_empty_bins}/{n_bins} non-empty bins)')
+    return ece
+
+def sfs(X_train, y_train, X_val, y_val, feature_names, n_bins=20):
+    remaining = list(feature_names)
+    selected = []
+
+    best_ece = np.inf
+    history = []
+
+    while len(remaining) > 0:
+        best_feature = None
+        best_candidate_ece = np.inf
+
+        for f in remaining:
+            candidate_features = selected + [f]
+
+            X_tr = X_train[candidate_features]
+            X_vl = X_val[candidate_features]
+
+            model = LogisticRegression(
+                penalty="l2",
+                solver="lbfgs",
+                max_iter=1000,
+            )
+            model.fit(X_tr, y_train)
+
+            probabilities = model.predict_proba(X_vl)[: ,1]
+            ece = classwise_ece(y_val, probabilities, n_bins=n_bins)
+
+            if ece < best_candidate_ece:
+                best_candidate_ece = ece
+                best_feature = f
+        
+        if best_candidate_ece >= best_ece:
+            print(f'No improvement in ECE. Stopping selection.')
+            break
+
+        selected.append(best_feature)
+        remaining.remove(best_feature)
+        best_ece = best_candidate_ece
+
+        history.append((list(selected), best_ece))
+
+        print(f'Added {best_feature}, ECE: {best_ece:.5f}')
+
+    return selected, history
 
 def run_pipeline(
     paths: list[str],
@@ -360,6 +475,74 @@ def run_pipeline(
     print(f"  Matchups shape        : {matchups.shape}")
     print(f"  Label balance         : {matchups['y'].mean():.3f}  (ideal = 0.500)")
 
+    train, val, test = time_based_split(matchups)
+
+    calculated_feature_cols = [c for c in matchups.columns if c.startswith("diff_")]
+
+    X_train, y_train = train[calculated_feature_cols], train["y"]
+    X_val,   y_val   = val[calculated_feature_cols], val["y"]
+    X_test,  y_test  = test[calculated_feature_cols], test["y"]
+
+    # Use Spearman correlation to identify and drop highly correlated features (> 0.7).
+    X_train_copy = X_train.copy()
+    corr_matrix = X_train.corr(method="spearman").abs()
+    target_corr = X_train_copy.apply(lambda col: col.corr(y_train, method="spearman")).abs()
+
+    to_drop = set()
+    columns = corr_matrix.columns
+
+    for i in range(len(columns)):
+        for j in range(i + 1, len(columns)):
+            f1, f2 = columns[i], columns[j]
+
+            if corr_matrix.iloc[i, j] > 0.7:
+                if target_corr[f1] < target_corr[f2]:
+                    to_drop.add(f2)
+                else:
+                    to_drop.add(f1)
+
+    print(f'Dropping features: {", ".join(list(to_drop))} due to high correlation (> 0.7)')
+    X_train = X_train.drop(columns=list(to_drop))
+    X_val = val[X_train.columns].copy()
+    X_test = test[X_train.columns].copy()
+    print("Features after filtering:", X_train.shape[1])
+
+    # Use Kolmogorov-Smirnov test to identify and drop features with significantly different distributions between train and val sets (p < 0.01).
+    keep_columns = []
+
+    for column in X_train.columns:
+        stat, p_value = ks_2samp(X_train[column], X_val[column])
+
+        if p_value >= 0.01:
+            keep_columns.append(column)
+        else:
+            print(f"Dropping {column} (p={p_value:.5f})")
+    
+    X_train = X_train[keep_columns]
+    X_val = X_val[keep_columns]
+    X_test = X_test[keep_columns]
+
+    print("Features after KS test filtering:", X_train.shape[1])
+
+    scaler = StandardScaler()
+
+    X_train_scaled = scaler.fit_transform(X_train)
+    X_val_scaled = scaler.transform(X_val)
+    X_test_scaled = scaler.transform(X_test)
+
+    X_train = pd.DataFrame(X_train_scaled, columns=X_train.columns, index=X_train.index)
+    X_val = pd.DataFrame(X_val_scaled, columns=X_val.columns, index=X_val.index)
+    X_test = pd.DataFrame(X_test_scaled, columns=X_test.columns, index=X_test.index)
+
+    lr_model = train_model(X_train, y_train)
+
+    probabilities = lr_model.predict_proba(X_val)[: ,1]
+    ece = classwise_ece(y_val, probabilities)
+
+    feature_subset, history = sfs(X_train, y_train, X_val, y_val, X_train.columns, n_bins=20)
+
+    print(f"\nSelected Feature Subset: {", ".join(feature_subset)}")
+
     return driver_features, matchups
 
 
@@ -375,6 +558,6 @@ DATA_PATHS = [
 if __name__ == "__main__":
     driver_features, matchups = run_pipeline(DATA_PATHS)
 
-    driver_features.to_csv("./driver_features.csv", index=False)
-    matchups.to_csv("./matchups.csv", index=False)
-    print("Outputs saved to driver_features.csv and matchups.csv")
+    driver_features.to_csv("./driver_features1.csv", index=False)
+    matchups.to_csv("./matchups1.csv", index=False)
+    print("Outputs saved to driver_features1.csv and matchups1.csv")
