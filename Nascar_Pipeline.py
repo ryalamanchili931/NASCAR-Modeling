@@ -54,17 +54,19 @@ import numpy as np
 from scipy.stats import ks_2samp
 from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import LogisticRegression
+import matplotlib.pyplot as plt
+import random as rand
 from itertools import combinations
 
 # ── CONFIGURATION ─────────────────────────────────────────────────────────────
 
-LAMBDA: float           = 0.9
+LAMBDA: float           = 0.925
 K: float                = 1.0
 MIN_TRACK_RACES: int    = 3
 MOMENTUM_WINDOW: int    = 4
-BASELINE_WINDOW: int    = 20
+BASELINE_WINDOW: int    = 36
 MIN_RACE_HISTORY: int   = 10
-CLASSWISE_ECE_MIN_NON_EMPTY_BINS: float = 0.9
+CLASSWISE_ECE_MIN_NON_EMPTY_BINS: float = 0.8
 
 FEATURE_COLS: list[str] = [
     "finish",
@@ -75,13 +77,13 @@ FEATURE_COLS: list[str] = [
     "avg",
     "green_flag_passing_diff",
     "green_flag_passes",
-    "green_flag_times_passed",
-    "quality_passes",
+    #"green_flag_times_passed",
+    #"quality_passes",
     "pct_quality_passes",
     "fastest_lap",
-    "top_15_laps",
+    #"top_15_laps",
     "pct_top_15_laps",
-    "laps_led",
+    #"laps_led",
     "pct_laps_led",
     "rating",
 ]
@@ -189,6 +191,7 @@ def compute_driver_features(
     Returns DataFrame with columns:
       driver, race_id, finish, momentum, adj_{feat} × n_features
     """
+    n_eff = []
     # Global means — used as last-resort fallback (no prior races at all)
     global_means       = df[feature_cols].mean()
     global_track_means = df.groupby("track_type")[feature_cols].mean()
@@ -269,15 +272,17 @@ def compute_driver_features(
                         t_wavg, t_neff = weighted_avg_neff(
                             track_prior[feat].values, track_weights
                         )
+                        n_eff.append(t_neff)
                         record[f"adj_{feat}"] = shrink(
-                            t_wavg, t_neff, g_track_mean[feat], k
+                            t_wavg, t_neff, baseline_adj, k
                         )
 
             result_rows.append(record)
     result_rows = pd.DataFrame(result_rows)
     for year, count in result_rows["year"].value_counts().sort_index().items():
         print(f"Year {year}: {count}")
-    
+    #plt.hist(n_eff, bins=30)
+    #plt.show()
     return pd.DataFrame(result_rows)
 
 
@@ -383,6 +388,7 @@ def classwise_ece(y_true, y_prob, n_bins=20):
 
 def sfs(X_train, y_train, X_val, y_val, feature_names, n_bins=20):
     remaining = list(feature_names)
+    rand.shuffle(remaining)
     selected = []
 
     best_ece = np.inf
