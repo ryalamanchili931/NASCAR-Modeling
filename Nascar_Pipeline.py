@@ -58,12 +58,13 @@ from itertools import combinations
 
 # ── CONFIGURATION ─────────────────────────────────────────────────────────────
 
-LAMBDA: float           = 0.85
-K: float                = 10.0
+LAMBDA: float           = 0.9
+K: float                = 1.0
 MIN_TRACK_RACES: int    = 3
 MOMENTUM_WINDOW: int    = 4
 BASELINE_WINDOW: int    = 20
 MIN_RACE_HISTORY: int   = 10
+CLASSWISE_ECE_MIN_NON_EMPTY_BINS: float = 0.9
 
 FEATURE_COLS: list[str] = [
     "finish",
@@ -91,11 +92,6 @@ FEATURE_COLS: list[str] = [
 def load_single(path: str) -> pd.DataFrame:
     """Load and normalise one CSV file."""
     df = pd.read_csv(path)
-    # 2022-2024 use 'driver_name'; 2025 has unnamed first col + extra 'driver2'
-    if df.columns[0].strip() == "":
-        df = df.rename(columns={df.columns[0]: "driver_name"})
-    if "driver2" in df.columns:
-        df = df.drop(columns=["driver2"])
     df = df.rename(columns={"driver_name": "driver"})
     df["driver"]    = df["driver"].str.strip()
     df["race_date"] = pd.to_datetime(df["race_date"])
@@ -112,6 +108,8 @@ def load_data(paths: list[str]) -> pd.DataFrame:
     for col in FEATURE_COLS:
         if col in df.columns and df[col].isna().any():
             df[col] = df[col].fillna(df[col].median())
+    for year, count in df.groupby(df["race_date"].dt.year).size().sort_index().items():
+        print(f"Year {year}: {count}")
     return df
 
 
@@ -276,7 +274,10 @@ def compute_driver_features(
                         )
 
             result_rows.append(record)
-
+    result_rows = pd.DataFrame(result_rows)
+    for year, count in result_rows["year"].value_counts().sort_index().items():
+        print(f"Year {year}: {count}")
+    
     return pd.DataFrame(result_rows)
 
 
@@ -373,8 +374,8 @@ def classwise_ece(y_true, y_prob, n_bins=20):
             confidence = np.mean(y_prob[in_bin])
             ece += (bin_size / len(y_prob)) * abs(accuracy - confidence)
         
-    if non_empty_bins < 0.8 * n_bins:
-        print(f'Fewer than 80% of bins contain predictions.')
+    if non_empty_bins < CLASSWISE_ECE_MIN_NON_EMPTY_BINS * n_bins:
+        print(f'Fewer than {CLASSWISE_ECE_MIN_NON_EMPTY_BINS * 100:.0f}% of bins contain predictions.')
         return 1.0
 
     print(f'Classwise ECE: {ece:.4f} (calculated over {non_empty_bins}/{n_bins} non-empty bins)')
@@ -483,6 +484,23 @@ def run_pipeline(
     X_val,   y_val   = val[calculated_feature_cols], val["y"]
     X_test,  y_test  = test[calculated_feature_cols], test["y"]
 
+    # Use Kolmogorov-Smirnov test to identify and drop features with significantly different distributions between train and val sets (p < 0.01).
+    keep_columns = []
+
+    for column in X_train.columns:
+        stat, p_value = ks_2samp(X_train[column], X_val[column])
+
+        if stat <= 0.1:
+            keep_columns.append(column)
+        else:
+            print(f"Dropping {column} (p={p_value:.5f}) (stat={stat:.5f})")
+    
+    X_train = X_train[keep_columns]
+    X_val = X_val[keep_columns]
+    X_test = X_test[keep_columns]
+
+    print("Features after KS test filtering:", X_train.shape[1])
+
     # Use Spearman correlation to identify and drop highly correlated features (> 0.7).
     X_train_copy = X_train.copy()
     corr_matrix = X_train.corr(method="spearman").abs()
@@ -507,23 +525,9 @@ def run_pipeline(
     X_test = test[X_train.columns].copy()
     print("Features after filtering:", X_train.shape[1])
 
-    # Use Kolmogorov-Smirnov test to identify and drop features with significantly different distributions between train and val sets (p < 0.01).
-    keep_columns = []
 
-    for column in X_train.columns:
-        stat, p_value = ks_2samp(X_train[column], X_val[column])
 
-        if p_value >= 0.01:
-            keep_columns.append(column)
-        else:
-            print(f"Dropping {column} (p={p_value:.5f})")
-    
-    X_train = X_train[keep_columns]
-    X_val = X_val[keep_columns]
-    X_test = X_test[keep_columns]
-
-    print("Features after KS test filtering:", X_train.shape[1])
-
+    # Scale features (0 mean, 1 standard deviation)
     scaler = StandardScaler()
 
     X_train_scaled = scaler.fit_transform(X_train)
