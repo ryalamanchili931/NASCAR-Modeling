@@ -60,13 +60,13 @@ from itertools import combinations
 
 # ── CONFIGURATION ─────────────────────────────────────────────────────────────
 
-LAMBDA: float           = 0.925
+LAMBDA: float           = 0.85
 K: float                = 1.0
 MIN_TRACK_RACES: int    = 3
 MOMENTUM_WINDOW: int    = 4
-BASELINE_WINDOW: int    = 36
+BASELINE_WINDOW: int    = 108
 MIN_RACE_HISTORY: int   = 10
-CLASSWISE_ECE_MIN_NON_EMPTY_BINS: float = 0.8
+CLASSWISE_ECE_MIN_NON_EMPTY_BINS: float = 0.90
 
 FEATURE_COLS: list[str] = [
     "finish",
@@ -315,6 +315,7 @@ def generate_matchups(
             y     = 1 if finish_map[d_i] < finish_map[d_j] else 0
 
             matchup_rows.append({
+                "year": year,
                 "race_id":  race_id,
                 "driver_i": d_i,
                 "driver_j": d_j,
@@ -323,8 +324,8 @@ def generate_matchups(
             })
 
             matchup_rows.append({
-                "race_id":  race_id,
                 "year": year,
+                "race_id":  race_id,
                 "driver_i": d_j,
                 "driver_j": d_i,
                 "y":        1 - y,
@@ -353,7 +354,7 @@ def train_model(X, y):
     return model
 
 # Only works for binary classification with doubled data (y=1 and y=0 rows are exact inverses of each other).
-def classwise_ece(y_true, y_prob, n_bins=20):
+def classwise_ece(y_true, y_prob, n_bins=20, min_non_empty_bins=CLASSWISE_ECE_MIN_NON_EMPTY_BINS):
     y_true = np.array(y_true)
     y_prob = np.array(y_prob)
     
@@ -379,8 +380,8 @@ def classwise_ece(y_true, y_prob, n_bins=20):
             confidence = np.mean(y_prob[in_bin])
             ece += (bin_size / len(y_prob)) * abs(accuracy - confidence)
         
-    if non_empty_bins < CLASSWISE_ECE_MIN_NON_EMPTY_BINS * n_bins:
-        print(f'Fewer than {CLASSWISE_ECE_MIN_NON_EMPTY_BINS * 100:.0f}% of bins contain predictions.')
+    if non_empty_bins < min_non_empty_bins * n_bins:
+        print(f'Fewer than {min_non_empty_bins * 100:.0f}% of bins contain predictions.')
         return 1.0
 
     print(f'Classwise ECE: {ece:.4f} (calculated over {non_empty_bins}/{n_bins} non-empty bins)')
