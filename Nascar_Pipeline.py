@@ -379,9 +379,9 @@ def classwise_ece(y_true, y_prob, n_bins=20, min_non_empty_bins=CLASSWISE_ECE_MI
             accuracy = np.mean(y_true[in_bin])
             confidence = np.mean(y_prob[in_bin])
             ece += (bin_size / len(y_prob)) * abs(accuracy - confidence)
-        
+
     if non_empty_bins < min_non_empty_bins * n_bins:
-        print(f'Fewer than {min_non_empty_bins * 100:.0f}% of bins contain predictions.')
+        print(f'Fewer than {min_non_empty_bins * 100:.0f}% of bins contain predictions. Caution: ECE = {ece:.5f} may be unreliable.')
         return 1.0
 
     print(f'Classwise ECE: {ece:.4f} (calculated over {non_empty_bins}/{n_bins} non-empty bins)')
