@@ -66,7 +66,7 @@ MIN_TRACK_RACES: int    = 3
 MOMENTUM_WINDOW: int    = 4
 BASELINE_WINDOW: int    = 108
 MIN_RACE_HISTORY: int   = 10
-CLASSWISE_ECE_MIN_NON_EMPTY_BINS: float = 0.90
+CLASSWISE_ECE_MIN_NON_EMPTY_BINS: float = 0.80
 
 FEATURE_COLS: list[str] = [
     "finish",

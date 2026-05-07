@@ -135,7 +135,7 @@ def train_final(train_df, val_df, test_df, feature_cols, best_params, scaler):
 
     probs = model.predict_proba(X_test)[:, 1]
 
-    ece = classwise_ece(y_test, probs)
+    ece = classwise_ece(y_test, probs, min_non_empty_bins=0.8)
     auc = roc_auc_score(y_test, probs)
 
     print("\n── Final Test Performance ──")

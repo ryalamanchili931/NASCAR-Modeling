@@ -6,8 +6,9 @@ from sklearn.linear_model import LogisticRegression
 # Load data
 data = pd.read_csv("matchups1-Feature Subset.csv")
 
-feature_cols = [c for c in data.columns if c.startswith("diff_")]
-#feature_cols = [c for c in data.columns if c in ["diff_worst_track", "diff_green_flag_passing_diff_baseline", "diff_finish_track", "diff_pct_laps_led_track", "diff_green_flag_passing_diff_track"]]
+feature_cols = [c for c in data.columns if c.startswith("diff_")] # highly engineered
+#feature_cols = [c for c in data.columns if c in ["diff_worst_track", "diff_green_flag_passing_diff_baseline", "diff_finish_track", "diff_pct_laps_led_track", "diff_green_flag_passing_diff_track"]] # basic
+#feature_cols = [c for c in data.columns if c in ["diff_green_flag_passing_diff_ytd", "diff_pct_laps_led_ytd", "diff_green_flag_passes_ytd"] # paper
 
 # ── Proper split ─────────────────────────────────────────────
 train_mask = data["year"].isin([2022, 2023, 2024])
