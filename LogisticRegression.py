@@ -10,7 +10,7 @@ feature_cols = [c for c in data.columns if c.startswith("diff_")] # highly engin
 #feature_cols = [c for c in data.columns if c in ["diff_worst_track", "diff_green_flag_passing_diff_baseline", "diff_finish_track", "diff_pct_laps_led_track", "diff_green_flag_passing_diff_track"]] # basic
 #feature_cols = [c for c in data.columns if c in ["diff_green_flag_passing_diff_ytd", "diff_pct_laps_led_ytd", "diff_green_flag_passes_ytd"] # paper
 
-# ── Proper split ─────────────────────────────────────────────
+#Training and Testing
 train_mask = data["year"].isin([2022, 2023, 2024])
 test_mask  = data["year"] == 2025
 
@@ -23,12 +23,12 @@ y_test  = data.loc[test_mask, "y"]
 print("Train set size:", len(X_train))
 print("Test set size:", len(X_test))
 
-# ── Scaling ──────────────────────────────────────────────────
+#Scaling
 scaler = StandardScaler()
 X_train_scaled = scaler.fit_transform(X_train)
 X_test_scaled  = scaler.transform(X_test)
 
-# ── Model ────────────────────────────────────────────────────
+#Model
 model = LogisticRegression(
     penalty="l2",
     solver="lbfgs",
@@ -37,16 +37,15 @@ model = LogisticRegression(
 
 model.fit(X_train_scaled, y_train)
 
-# ── Probabilities (NOT predictions) ───────────────────────────
+#Probabilities
 y_prob = model.predict_proba(X_test_scaled)[:, 1]
 print("Sum of Probabilities:", y_prob.sum())
 print ("Actual Positives in Test Set:", y_test.sum())
 
-# ── ECE ──────────────────────────────────────────────────────
 ece = classwise_ece(y_test, y_prob, min_non_empty_bins=0.80)
-
 print("ECE:", ece)
 
+#Test on Non-Training Data
 race_id = 134
 
 driver_i = "Tyler Reddick"

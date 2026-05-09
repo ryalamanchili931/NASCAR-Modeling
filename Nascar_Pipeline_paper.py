@@ -1,54 +1,3 @@
-"""
-NASCAR Head-to-Head Prediction: Feature Engineering Pipeline
-============================================================
-
-Per-driver feature vector (n_features + 1 wide):
-
-  MOMENTUM (1 scalar)
-    Unweighted mean of `rating` over the last 4 prior races.
-    If fewer than 4 prior races exist, use however many are available.
-    If no prior races at all: fall back to global mean of rating.
-
-  ADJUSTED AVERAGE (n_features scalars)
-    For each feature, a two-stage blend:
-
-    Stage 1 — Baseline
-      Last 20 prior races, exponential decay applied.
-      weight_i = lambda ^ (age_i / 4)
-      where age_i = 0 for most recent, 1/4 for one before, etc.
-      Shrunk toward global mean:
-        baseline_adj = (n_eff / (n_eff + k)) * baseline_wavg
-                     + (k     / (n_eff + k)) * global_mean
-
-    Stage 2 — Long-term track type
-      All prior races of the same track_type, exponential decay applied.
-      Ages measured from driver's most recent overall race for consistency.
-      Shrunk toward global track-type mean:
-        track_adj = (n_eff / (n_eff + k)) * track_wavg
-                  + (k     / (n_eff + k)) * global_track_type_mean
-      Fallback: if fewer than min_track_races prior races of this track type,
-      use baseline_adj directly.
-
-    Final adj_{feature} = track_adj  (or baseline_adj if track fallback triggered)
-
-Edge cases (all documented):
-  No prior races at all      → momentum = global rating mean,
-                               adj_{feat} = global feature mean
-  Momentum < 4 prior races   → use however many exist, no shrinkage
-  Baseline < 20 prior races  → use however many exist, shrinkage still applied
-  Track type below threshold → fall back to baseline_adj
-
-Matchup vector = (driver_i − driver_j) across all n_features + 1 values.
-Target y = 1 if driver_i finished ahead of driver_j (lower finish position = better).
-
-Hyperparameters (tune via CV on training races):
-  lam             : decay base per 4-race unit        (default 0.85)
-  k               : shrinkage strength                (default 10.0)
-  min_track_races : track-type fallback threshold     (default 3)
-  momentum_window : races used for momentum scalar    (default 4)
-  baseline_window : races used for baseline layer     (default 20)
-"""
-
 import pandas as pd
 import numpy as np
 from scipy.stats import ks_2samp
@@ -58,7 +7,7 @@ import matplotlib.pyplot as plt
 import random as rand
 from itertools import combinations
 
-# ── CONFIGURATION ─────────────────────────────────────────────────────────────
+#Configuration
 
 LAMBDA: float           = 0.85
 K: float                = 1.0
@@ -89,10 +38,9 @@ FEATURE_COLS: list[str] = [
 ]
 
 
-# ── STEP 0: LOAD & CLEAN ──────────────────────────────────────────────────────
+#Data Setup
 
 def load_single(path: str) -> pd.DataFrame:
-    """Load and normalise one CSV file."""
     df = pd.read_csv(path)
     df = df.rename(columns={"driver_name": "driver"})
     df["driver"]    = df["driver"].str.strip()
@@ -101,10 +49,6 @@ def load_single(path: str) -> pd.DataFrame:
 
 
 def load_data(paths: list[str]) -> pd.DataFrame:
-    """
-    Load and concatenate multiple yearly CSVs, sorted chronologically.
-    Median-fills NaN values in feature columns across the combined dataset.
-    """
     df = pd.concat([load_single(p) for p in paths], ignore_index=True)
     df = df.sort_values("race_date").reset_index(drop=True)
     for col in FEATURE_COLS:
@@ -115,12 +59,9 @@ def load_data(paths: list[str]) -> pd.DataFrame:
     return df
 
 
-# ── STEP 1: ASSIGN RACE IDs ───────────────────────────────────────────────────
+#Assign Race IDs
 
 def assign_race_ids(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Each unique (race_date, track_name) pair → one race_id, numbered chronologically.
-    """
     race_keys = (
         df[["race_date", "track_name"]]
         .drop_duplicates()
@@ -132,25 +73,13 @@ def assign_race_ids(df: pd.DataFrame) -> pd.DataFrame:
     return df.merge(race_keys, on=["race_date", "track_name"], how="left")
 
 
-# ── STEP 3: COMPUTE FEATURES ──────────────────────────────────────────────────
+#Compute Features
 
 def compute_driver_features(
     df: pd.DataFrame,
     feature_cols: list[str],
-    lam: float           = LAMBDA,
-    k: float             = K,
-    min_track_races: int = MIN_TRACK_RACES,
-    momentum_window: int = MOMENTUM_WINDOW,
     baseline_window: int = BASELINE_WINDOW,
 ) -> pd.DataFrame:
-    """
-    For every (driver, race) computes:
-      momentum      — unweighted mean of rating over last momentum_window prior races
-      adj_{feature} — shrinkage-adjusted blended average per feature
-
-    Returns DataFrame with columns:
-      driver, race_id, finish, momentum, adj_{feat} × n_features
-    """
     n_eff = []
 
     df = df.sort_values(["driver", "race_date", "race_id"]).reset_index(drop=True)
@@ -162,9 +91,7 @@ def compute_driver_features(
 
         for idx in range(len(grp)):
             row        = grp.iloc[idx]
-            prior      = grp.iloc[:idx]       # strictly prior races — no leakage
-            #if len(prior) < MIN_RACE_HISTORY:
-            #    continue
+            prior      = grp.iloc[:idx]
             track_type = row["track_type"]
 
             record = {
@@ -195,35 +122,16 @@ def compute_driver_features(
                 else:
                     record["prev_year_rating"] = prior[prior["year"] == row["year"] - 1]["rating"].mean()
 
-            
-
-            # ── MOMENTUM ──────────────────────────────────────────────────────
-            # Unweighted mean of rating over last momentum_window prior races.
-            #recent             = prior.iloc[-momentum_window:]
-            #record["momentum"] = recent["rating"].mean()
-
-            # ── AVERAGE ──────────────────────────────────────────────
             if len(prior) == 0:
                 pass
             else:
-                # Stage 1: Baseline — last baseline_window races, decayed + shrunk
                 baseline_prior   = prior.iloc[-baseline_window:]
 
-                # Stage 2: Track-type — all prior races of same type, decayed
-                # Ages are measured from the driver's most recent overall race
-                # so recency is on the same scale across both layers.
                 #track_mask    = (prior["track_type"] == track_type).values
-                #track_indices = np.where(track_mask)[0]   # positions in prior (oldest→newest)
-
+                #track_indices = np.where(track_mask)[0]
                 #track_prior   = prior.iloc[track_indices]
-                #if len(track_prior) < min_track_races:
-                #    continue
 
                 for feat in feature_cols:
-                    # Baseline: weighted avg of last 20, shrunk toward global mean
-
-                    # Track type: weighted avg of all same-type, shrunk toward
-                    # global track-type mean. Fall back if too few races.
                     #record[f"{feat}_baseline"] = baseline_prior[feat].mean()
                     #record[f"{feat}_track"] = track_prior[feat].mean()
                     record[f"{feat}_ytd"] = ytd_prior[feat].mean()
@@ -232,22 +140,15 @@ def compute_driver_features(
     result_rows = pd.DataFrame(result_rows)
     for year, count in result_rows["year"].value_counts().sort_index().items():
         print(f"Year {year}: {count}")
-    #plt.hist(n_eff, bins=30)
-    #plt.show()
     return pd.DataFrame(result_rows)
 
 
-# ── STEP 4: MATCHUP GENERATION ────────────────────────────────────────────────
+#Matchup Generation
 
 def generate_matchups(
     driver_features: pd.DataFrame,
     feature_cols: list[str],
 ) -> pd.DataFrame:
-    """
-    For each race, generates all unordered (driver_i, driver_j) pairs with i < j.
-    Matchup vector = driver_i values − driver_j values.
-    Target y = 1 if driver_i finished ahead (lower finish position) of driver_j.
-    """
     value_cols = [f"{f}_ytd" for f in feature_cols]
     diff_cols  = [f"diff_{f}_ytd" for f in feature_cols]
 
@@ -286,7 +187,7 @@ def generate_matchups(
     return pd.DataFrame(matchup_rows)
 
 
-# ── STEP 5: FULL PIPELINE ─────────────────────────────────────────────────────
+#Pipeline
 
 def time_based_split(matchups):
     train = matchups[matchups["year"].isin([2022, 2023])].copy()
@@ -393,14 +294,6 @@ def run_pipeline(
     momentum_window: int    = MOMENTUM_WINDOW,
     baseline_window: int    = BASELINE_WINDOW,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    End-to-end pipeline. Returns:
-      driver_features : one row per (driver, race)
-                        columns: driver, race_id, finish, momentum, adj_{feat}...
-      matchups        : one row per (race, driver_i, driver_j)
-                        columns: race_id, driver_i, driver_j, y,
-                                 diff_momentum, diff_{feat}...
-    """
     print("Loading data...")
     df = load_data(paths)
 
@@ -507,8 +400,6 @@ def run_pipeline(
 
     return driver_features, matchups
 
-
-# ── ENTRYPOINT ────────────────────────────────────────────────────────────────
 
 DATA_PATHS = [
     "2022 Loop Data.csv",

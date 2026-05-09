@@ -1,35 +1,3 @@
-"""
-NASCAR Head-to-Head Prediction: GD-Enhanced Training Pipeline
-=============================================================
-
-Integrates two gradient-descent components on top of the feature engineering pipeline:
-
-  Option 3 — Learnable lam & k
-    lam (decay base) and k (shrinkage strength) are treated as differentiable
-    parameters and optimised via Adam on a pairwise BCE loss computed directly
-    from the feature engineering output. This makes the track-type decay
-    data-driven rather than hand-tuned.
-
-  Option 2 — GD Feature Weighter
-    A small learned linear layer that re-weights the diff feature vector before
-    it enters the SVM. Trained with BCE loss + L2 regularisation.
-    Lets the model discover which engineered features (and which track-type
-    adjusted ones) matter most for head-to-head prediction.
-
-Full pipeline:
-  Raw CSVs
-    → [Option 3] optimise lam / k via GD
-    → run_pipeline(lam*, k*) → matchups DataFrame
-    → [Option 2] train FeatureWeighter on matchups
-    → reweight diff features
-    → StandardScaler → SVC(linear | poly | rbf | sigmoid)
-    → compare all four kernels, select best by AUC
-    → evaluate (AUC, Brier, classification report)
-
-Dependencies:
-  numpy, pandas, scikit-learn, torch
-"""
-
 import numpy as np
 import pandas as pd
 import torch
@@ -50,22 +18,16 @@ from Nascar_Pipeline import (
     DATA_PATHS,
     LAMBDA,
     K,
-    MIN_TRACK_RACES,
-    MOMENTUM_WINDOW,
-    BASELINE_WINDOW,
 )
 
-# ── CONFIGURATION ─────────────────────────────────────────────────────────────
+#Hyper Parameter Configuration
 
-TRAIN_SPLIT      : float = 0.80   # fraction of race_ids used for training
-GD_LR            : float = 0.01   # learning rate for both GD stages
-GD_EPOCHS_PARAMS : int   = 150    # epochs for lam/k optimisation (Option 3)
-GD_EPOCHS_FEAT   : int   = 200    # epochs for feature weighter    (Option 2)
-L2_REG           : float = 1e-3   # L2 penalty on feature weights
+TRAIN_SPLIT      : float = 0.80   
+GD_LR            : float = 0.01   
+GD_EPOCHS_PARAMS : int   = 150    
+GD_EPOCHS_FEAT   : int   = 200    
+L2_REG           : float = 1e-3   
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-
-# ── TEMPORAL TRAIN / TEST SPLIT ───────────────────────────────────────────────
 
 def temporal_split(
     matchups: pd.DataFrame,
@@ -87,34 +49,7 @@ def get_diff_cols(feature_cols: list[str]) -> list[str]:
     return ["diff_momentum"] + [f"diff_{f}" for f in feature_cols]
 
 
-# ── OPTION 3: LEARNABLE lam AND k ────────────────────────────────────────────
-#
-# Strategy:
-#   run_pipeline() is called once upfront with default lam/k to produce the
-#   matchups DataFrame. The training matchups are split into n_batches chunks
-#   by race_id. Each loss call is just a BCE computation on a frozen numpy
-#   slice — no pipeline reruns at all during optimisation.
-#
-#   Finite-difference gradients are used because the pipeline is not
-#   differentiable. Adam tracks moment estimates across all batch updates.
-#
-#   Note: because the matchups are fixed at default lam/k, the gradient signal
-#   guides lam/k toward values that would have produced lower loss on those
-#   features — a first-order approximation. The final pipeline rerun with
-#   optimal lam*/k* produces the true adjusted features for SVM training.
-
 class ParamOptimiser:
-    """
-    Optimises lam and k via finite-difference Adam on precomputed matchups.
-
-    The matchups DataFrame (from run_pipeline) is passed in once and frozen.
-    Each loss call slices a batch of rows by race_id and computes BCE — pure
-    numpy, no pandas groupby, no pipeline reruns.
-
-    Per batch: 3 loss calls (centre, lam+eps, k+eps) → 1 Adam update.
-    Total cost: O(epochs × n_batches × batch_matchups) — very fast.
-    """
-
     def __init__(
         self,
         matchups: pd.DataFrame,
@@ -138,7 +73,6 @@ class ParamOptimiser:
         self._t  = 0
         self._b1, self._b2, self._ep = 0.9, 0.999, 1e-8
 
-        # Freeze training matchups as sorted numpy arrays — never touched again
         diff_cols  = get_diff_cols(feature_cols)
         train_m    = matchups[matchups["race_id"].isin(train_race_ids)].copy()
         train_m    = train_m.sort_values("race_id").reset_index(drop=True)
@@ -161,17 +95,9 @@ class ParamOptimiser:
               f"{total:,} matchups total")
 
     def _loss(self, lam: float, k: float, mask: np.ndarray) -> float:
-        """
-        BCE loss on a batch slice. Uses diff_finish as the logit signal —
-        the same feature the pipeline adjusts most directly via lam/k.
-        lam and k modulate the signal scale as a proxy for their effect
-        on the underlying weighted averages.
-        """
         diff  = self._diff_finish[mask]
         y     = self._y[mask]
-        # lam controls recency sensitivity; k controls shrinkage toward mean.
-        # Scaling diff by lam and shifting by 1/k approximates their combined
-        # effect on the adjusted finish difference without rerunning the pipeline.
+
         logit = -(diff * lam - 1.0 / k)
         prob  = 1.0 / (1.0 + np.exp(-logit))
         prob  = np.clip(prob, 1e-7, 1 - 1e-7)
@@ -213,22 +139,7 @@ class ParamOptimiser:
         print(f"\n  ✓ Optimal lam={self.lam:.4f}  k={self.k:.4f}")
         return self.lam, self.k
 
-
-# ── OPTION 2: GD FEATURE WEIGHTER ────────────────────────────────────────────
-
 class FeatureWeighter(nn.Module):
-    """
-    Learns a per-feature soft weight vector via gradient descent.
-    Applied as an element-wise scale on the diff feature vector.
-
-    Architecture:
-      w = softmax(raw_weights) * n_features    # sums to n_features
-      output = input * w
-
-    This is a linear transformation with a sum constraint, so no feature
-    can be completely zeroed globally — it redistributes importance.
-    """
-
     def __init__(self, n_features: int):
         super().__init__()
         self.raw_weights = nn.Parameter(torch.zeros(n_features))
@@ -239,7 +150,6 @@ class FeatureWeighter(nn.Module):
         return x * w
 
     def get_weights(self, feature_names: list[str]) -> pd.Series:
-        """Returns learned weights as a named Series for inspection."""
         w = torch.softmax(self.raw_weights, dim=0).detach().cpu().numpy()
         w *= self.n_features
         return pd.Series(w, index=feature_names).sort_values(ascending=False)
@@ -253,10 +163,6 @@ def train_feature_weighter(
     epochs: int = GD_EPOCHS_FEAT,
     l2_reg: float = L2_REG,
 ) -> FeatureWeighter:
-    """
-    Trains FeatureWeighter with BCE loss + L2 regularisation on weight magnitudes.
-    Uses a thin logistic head so gradients flow back into the weights cleanly.
-    """
     print("\n── Option 2: Training FeatureWeighter via Adam ──")
 
     model     = FeatureWeighter(n_features).to(DEVICE)
@@ -285,7 +191,7 @@ def train_feature_weighter(
         if epoch % 40 == 0 or epoch == 1:
             print(f"  Epoch {epoch:>3d} | loss={loss.item():.5f} | bce={bce_loss.item():.5f}")
 
-    print("  ✓ FeatureWeighter trained")
+    print("FeatureWeighter trained")
     return model
 
 
@@ -293,7 +199,6 @@ def apply_weighter(
     model: FeatureWeighter,
     X: np.ndarray,
 ) -> np.ndarray:
-    """Apply trained weighter to numpy array, return reweighted numpy array."""
     model.eval()
     with torch.no_grad():
         X_t  = torch.tensor(X, dtype=torch.float32).to(DEVICE)
@@ -301,22 +206,11 @@ def apply_weighter(
     return X_w.cpu().numpy()
 
 
-# ── SVM TRAINING & EVALUATION ─────────────────────────────────────────────────
+#SVM TRAINING
 
-# Kernel configurations matching the four kernels from the paper.
-#
-# C  : continuous, sampled log-uniformly from [0.1, 50] via RandomizedSearchCV.
-#      loguniform(0.1, 50) biases sampling toward smaller values where the
-#      decision boundary is most sensitive, while still exploring up to 50.
-#
-# degree : discrete {2, 3, 4} — applies to poly kernel only (ignored by others).
-#
-# gamma  : applies to rbf, poly, sigmoid.
-# coef0  : applies to poly, sigmoid.
-
-C_DIST = loguniform(0.1, 50)          # continuous C ∈ [0.1, 50]
-DEGREE_VALUES = [2, 3, 4]             # discrete degree for poly kernel
-N_ITER_SEARCH = 40                    # random search iterations per kernel
+C_DIST = loguniform(0.1, 50)          
+DEGREE_VALUES = [2, 3, 4]             
+N_ITER_SEARCH = 40                    
 
 KERNEL_CONFIGS: dict[str, dict] = {
     "linear": {
@@ -341,7 +235,6 @@ KERNEL_CONFIGS: dict[str, dict] = {
 
 
 def _build_kernel_pipe(kernel: str) -> Pipeline:
-    """Returns a Pipeline(scaler + calibrated SVC) for the given kernel."""
     base = SVC(kernel=kernel, class_weight="balanced", probability=False)
     calibrated = CalibratedClassifierCV(base, method="isotonic", cv=5)
     return Pipeline([
@@ -351,7 +244,6 @@ def _build_kernel_pipe(kernel: str) -> Pipeline:
 
 
 def _build_kernel_pipe_for_search(kernel: str) -> Pipeline:
-    """Returns a Pipeline(scaler + bare SVC) suitable for GridSearchCV."""
     base = SVC(kernel=kernel, class_weight="balanced", probability=True)
     return Pipeline([
         ("scaler", StandardScaler()),
@@ -366,17 +258,7 @@ def benchmark_kernels(
     y_test: np.ndarray,
     tune_hyperparams: bool = False,
 ) -> tuple[dict[str, dict], str]:
-    """
-    Trains and evaluates all four kernels (linear, poly, rbf, sigmoid).
-
-    For each kernel:
-      - If tune_hyperparams=True: GridSearchCV with TimeSeriesSplit(5)
-      - Otherwise: default C=1.0 with CalibratedClassifierCV
-
-    Returns:
-      kernel_results : dict  kernel → {model, train_auc, test_auc, test_brier, report}
-      best_kernel    : str   kernel name with highest test AUC
-    """
+    
     print("\n" + "=" * 60)
     print("Kernel Benchmark: linear | poly | rbf | sigmoid")
     print("=" * 60)
@@ -405,7 +287,6 @@ def benchmark_kernels(
             model = _build_kernel_pipe(kernel)
             model.fit(X_train, y_train)
 
-        # ── Metrics ───────────────────────────────────────────────────────────
         train_probs = model.predict_proba(X_train)[:, 1]
         test_probs  = model.predict_proba(X_test)[:, 1]
         test_preds  = model.predict(X_test)
@@ -430,7 +311,6 @@ def benchmark_kernels(
             "report":      report,
         }
 
-    # ── Summary table ─────────────────────────────────────────────────────────
     print("\n" + "=" * 60)
     print("Kernel Comparison Summary")
     print("=" * 60)
@@ -459,7 +339,6 @@ def evaluate(
     y: np.ndarray,
     label: str = "Test",
 ) -> None:
-    """Standalone evaluation for a single model (used outside benchmark)."""
     probs = model.predict_proba(X)[:, 1]
     preds = model.predict(X)
 
@@ -472,7 +351,7 @@ def evaluate(
     print(f"\n{classification_report(preds, y, target_names=['j ahead', 'i ahead'])}")
 
 
-# ── FULL PIPELINE ─────────────────────────────────────────────────────────────
+#Pipeline
 
 def run_full_pipeline(
     data_paths: list[str]    = DATA_PATHS,
@@ -480,23 +359,6 @@ def run_full_pipeline(
     tune_hyperparams: bool   = False,
     run_param_opt: bool      = True,
 ) -> dict:
-    """
-    End-to-end pipeline combining Options 2 and 3 with SVM.
-
-    Steps:
-      1. Run pipeline once with default lam/k → matchups
-      2. [Option 3] Optimise lam/k on training matchups via finite-diff Adam
-      3. If params changed, rerun pipeline with optimal lam*/k*
-      4. Temporal train/test split
-      5. [Option 2] Train FeatureWeighter on training matchups
-      6. Reweight features for both splits
-      7. Benchmark all four kernels, select best by AUC
-      8. Evaluate on test set
-
-    Returns dict with model components for downstream use.
-    """
-
-    # ── Step 1: Run pipeline once with defaults ───────────────────────────────
     print("=" * 60)
     print("Step 1: Running pipeline with default lam/k")
     print("=" * 60)
@@ -514,7 +376,6 @@ def run_full_pipeline(
     cutoff_idx     = int(len(all_race_ids) * TRAIN_SPLIT)
     train_race_ids = set(all_race_ids[:cutoff_idx])
 
-    # ── Step 2: Option 3 — Optimise lam and k ────────────────────────────────
     if run_param_opt:
         print("\n" + "=" * 60)
         print("Step 2: Option 3 — Optimising lam / k via GD")
@@ -530,7 +391,6 @@ def run_full_pipeline(
         opt_lam, opt_k = LAMBDA, K
         print(f"\nStep 2: Skipped param optimisation — using lam={opt_lam}, k={opt_k}")
 
-    # ── Step 3: Rerun pipeline only if params actually changed ────────────────
     params_changed = (abs(opt_lam - LAMBDA) > 1e-4 or abs(opt_k - K) > 1e-4)
     if run_param_opt and params_changed:
         print("\n" + "=" * 60)
@@ -546,7 +406,6 @@ def run_full_pipeline(
         print("\nStep 3: Params unchanged — reusing initial matchups")
         matchups = matchups_default
 
-    # ── Step 4: Temporal split ────────────────────────────────────────────────
     print("\n" + "=" * 60)
     print("Step 4: Temporal train/test split")
     print("=" * 60)
@@ -559,23 +418,19 @@ def run_full_pipeline(
     X_test  = test_m[diff_cols].values.astype(np.float32)
     y_test  = test_m["y"].values.astype(np.float32)
 
-    # ── Step 5: Option 2 — Train FeatureWeighter ─────────────────────────────
     print("\n" + "=" * 60)
     print("Step 5: Option 2 — Training FeatureWeighter")
     print("=" * 60)
 
     weighter = train_feature_weighter(X_train, y_train, n_features=len(diff_cols))
 
-    # Print top features by learned weight
     weights = weighter.get_weights(diff_cols)
     print("\n  Top 10 features by learned weight:")
     print(weights.head(10).to_string())
 
-    # ── Step 6: Reweight features ─────────────────────────────────────────────
     X_train_w = apply_weighter(weighter, X_train)
     X_test_w  = apply_weighter(weighter, X_test)
 
-    # ── Step 7 & 8: Benchmark all four kernels, select best ───────────────────
     kernel_results, best_kernel = benchmark_kernels(
         X_train_w, y_train,
         X_test_w,  y_test,
@@ -590,26 +445,16 @@ def run_full_pipeline(
         "weighter":       weighter,
         "best_kernel":    best_kernel,
         "best_model":     best_model,
-        "kernel_results": kernel_results,   # all four models + metrics
+        "kernel_results": kernel_results,
         "diff_cols":      diff_cols,
         "matchups":       matchups,
         "feature_weights": weights,
     }
 
-
-# ── INFERENCE HELPER ──────────────────────────────────────────────────────────
-
 def predict_matchup(
     components: dict,
     diff_vector: np.ndarray,
 ) -> dict:
-    """
-    Given a diff feature vector for a new (driver_i, driver_j) matchup,
-    returns probability that driver_i finishes ahead of driver_j.
-
-    diff_vector: 1-D numpy array of length len(diff_cols),
-                 ordered as [diff_momentum, diff_finish, diff_start, ...]
-    """
     weighter = components["weighter"]
     svm      = components["best_model"]
 
@@ -624,14 +469,12 @@ def predict_matchup(
     }
 
 
-# ── ENTRYPOINT ────────────────────────────────────────────────────────────────
-
 if __name__ == "__main__":
     components = run_full_pipeline(
         data_paths       = DATA_PATHS,
         feature_cols     = FEATURE_COLS,
-        tune_hyperparams = False,   # set True for GridSearch over C/gamma/degree (slower)
-        run_param_opt    = True,    # set False to skip Option 3 and use defaults
+        tune_hyperparams = False,
+        run_param_opt    = True,
     )
 
     print("\n── Learned hyperparameters ──")

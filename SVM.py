@@ -6,23 +6,12 @@ from sklearn.calibration import CalibratedClassifierCV
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import ParameterSampler
 from sklearn.metrics import roc_auc_score
-
 from scipy.stats import loguniform
-
 from Nascar_Pipeline import classwise_ece
 
-
-# ─────────────────────────────────────────────
-# CONFIG
-# ─────────────────────────────────────────────
-
+# Configuration
 N_BINS = 20
-N_ITER = 25  # random search iterations
-
-
-# ─────────────────────────────────────────────
-# TEMPORAL SPLIT (3-way)
-# ─────────────────────────────────────────────
+N_ITER = 25  
 
 def temporal_split_3way(df):
 
@@ -33,10 +22,6 @@ def temporal_split_3way(df):
     return train, val, test
 
 
-# ─────────────────────────────────────────────
-# HYPERPARAM SEARCH (ECE OBJECTIVE)
-# ─────────────────────────────────────────────
-
 def tune_svm(train_df, val_df, feature_cols):
     print("\n── Hyperparameter tuning (ECE objective) ──")
 
@@ -45,14 +30,13 @@ def tune_svm(train_df, val_df, feature_cols):
     X_val   = val_df[feature_cols].values
     y_val   = val_df["y"].values
 
-    # scale ONLY on train
     scaler = StandardScaler()
     X_train = scaler.fit_transform(X_train)
     X_val   = scaler.transform(X_val)
 
     param_dist = {
         "C": loguniform(0.1, 50),
-        "kernel": ["linear", "rbf"], # poly, sigmoid
+        "kernel": ["linear", "rbf"], 
         "degree": [2, 3, 4],
         "gamma": loguniform(1e-4, 10),
     }
@@ -66,10 +50,8 @@ def tune_svm(train_df, val_df, feature_cols):
     for i, params in enumerate(sampler, 1):
         kernel = params["kernel"]
 
-        # degree only matters for poly
         degree = params["degree"] if kernel == "poly" else 3
 
-        # gamma only matters for rbf, poly, sigmoid
         gamma = params["gamma"] if kernel in ["rbf", "poly", "sigmoid"] else "scale"
 
         base = SVC(
@@ -102,15 +84,9 @@ def tune_svm(train_df, val_df, feature_cols):
 
     return best_params, scaler
 
-
-# ─────────────────────────────────────────────
-# FINAL TRAIN + TEST
-# ─────────────────────────────────────────────
-
 def train_final(train_df, val_df, test_df, feature_cols, best_params, scaler):
     print("\n── Final training ──")
 
-    # combine train + val
     train_full = pd.concat([train_df, val_df])
 
     X_train = train_full[feature_cols].values
@@ -144,11 +120,6 @@ def train_final(train_df, val_df, test_df, feature_cols, best_params, scaler):
 
     return model
 
-
-# ─────────────────────────────────────────────
-# MAIN
-# ─────────────────────────────────────────────
-
 def run_svm_pipeline(path):
     df = pd.read_csv(path)
 
@@ -156,21 +127,15 @@ def run_svm_pipeline(path):
 
     print("Using features:", feature_cols)
 
-    # split
     train_df, val_df, test_df = temporal_split_3way(df)
 
     print(f"Train: {len(train_df)} | Val: {len(val_df)} | Test: {len(test_df)}")
 
-    # tune
     best_params, scaler = tune_svm(train_df, val_df, feature_cols)
 
-    # final train
     model = train_final(train_df, val_df, test_df, feature_cols, best_params, scaler)
 
     return model
-
-
-# ─────────────────────────────────────────────
 
 if __name__ == "__main__":
     model = run_svm_pipeline("matchups1-Feature Subset.csv")
